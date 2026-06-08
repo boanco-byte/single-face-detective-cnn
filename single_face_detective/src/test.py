@@ -1,4 +1,5 @@
 import os
+import cv2
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -119,7 +120,21 @@ def predict_folder(folder_path):
 
 # ================= MAIN =================
 if __name__ == "__main__":
+    test_image_path = "test.img"
+    test_image = cv2.imread(test_image_path)
+    if test_image is None:
+        print(f"Không thể mở hoặc tìm thấy ảnh tại đường dẫn: {test_image_path}")
+        exit()
+    
+    Height, Width, Channels = test_image.shape
 
-    # test 1 ảnh
-    test_image = "test.jpg"
-    print("Single image:", predict_image(test_image))
+    result = predict_image(test_image_path)
+    x1, y1, x2, y2 = result['bbox']
+    out_image = cv2.rectangle(test_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+   
+    label = f"Face: {result['confidence']*100:.1f}%"
+    cv2.putText(out_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2) 
+    cv2.imshow("Result", out_image)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
