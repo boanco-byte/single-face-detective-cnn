@@ -10,38 +10,39 @@ class CNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(in_channels = 3, out_channels = 32, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 32),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(kernel_size = 2),
 
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(in_channels = 32, out_channels = 64, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 64),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(kernel_size = 2),
 
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 128),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(kernel_size = 2),
 
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(in_channels = 128, out_channels = 256, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 256),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(kernel_size = 2),
 
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(in_channels = 256, out_channels = 512, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 512),
             nn.ReLU(),
 
-            nn.AdaptiveAvgPool2d((1,1)),
+            nn.AdaptiveAvgPool2d((3, 3)),
+
             nn.Flatten(),
 
-            nn.Linear(512, 128),
+            nn.Linear(in_features = 512 * 3 * 3, out_features = 128),
             nn.ReLU(),
             nn.Dropout(0.2),
 
-            nn.Linear(128, 5)
+            nn.Linear(in_features = 128, out_features = 5)
         )
 
     def forward(self, x):
@@ -52,7 +53,8 @@ class CNN(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ================= LOAD CHECKPOINT =================
-checkpoint_path = "checkpoints/model.pth"
+current_dir = os.path.dirname(os.path.abspath(__file__))
+checkpoint_path = os.path.join(current_dir, '..', 'checkpoints/model.pth')
 
 checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -60,7 +62,7 @@ model = CNN().to(device)
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-print(f"Loaded model from epoch {checkpoint['epoch']} | best acc = {checkpoint['best_acc']:.2f}%")
+#print(f"Loaded model from epoch {checkpoint['epoch']} | best acc = {checkpoint['best_acc']:.2f}%")
 
 # ================= TRANSFORM =================
 transform = transforms.Compose([
@@ -79,15 +81,27 @@ def predict_image(image_path):
 
     with torch.no_grad():
         outputs = model(image)
-        # outputs: [confidence, x1, y1, x2, y2]
+        # outputs: [confidence, cx, cy, w, h]
         confidence = torch.sigmoid(outputs[0, 0]).item()
         
-        if confidence > 0.5:
-            # Denormalize bounding box from [0, 1] to image dimensions
-            x1 = outputs[0, 1].item() * original_size[0]
-            y1 = outputs[0, 2].item() * original_size[1]
-            x2 = outputs[0, 3].item() * original_size[0]
-            y2 = outputs[0, 4].item() * original_size[1]
+        if confidence <= 0.5:
+            # Convert predicted YOLO-format center box to image coordinates
+            bbox = torch.sigmoid(outputs[0, 1:5])
+            cx = bbox[0].item() * original_size[0]
+            cy = bbox[1].item() * original_size[1]
+            w = bbox[2].item() * original_size[0]
+            h = bbox[3].item() * original_size[1]
+
+            x1 = cx - w / 2
+            y1 = cy - h / 2
+            x2 = cx + w / 2
+            y2 = cy + h / 2
+
+            # Clamp coordinates to image bounds
+            x1 = max(0, min(x1, original_size[0]))
+            y1 = max(0, min(y1, original_size[1]))
+            x2 = max(0, min(x2, original_size[0]))
+            y2 = max(0, min(y2, original_size[1]))
             
             return {
                 "face_detected": True,
@@ -119,22 +133,33 @@ def predict_folder(folder_path):
 
 
 # ================= MAIN =================
+# ================= MAIN =================
 if __name__ == "__main__":
-    test_image_path = "test.img"
+    test_image_path = r"C:/CNN/dataset/train/images/ashton-video_mov-81_jpg.rf.EqYEUZpxO6yVYNWbx5hY.jpg"
+    print("1. Đang đọc ảnh bằng OpenCV...")
     test_image = cv2.imread(test_image_path)
     if test_image is None:
         print(f"Không thể mở hoặc tìm thấy ảnh tại đường dẫn: {test_image_path}")
         exit()
     
-    Height, Width, Channels = test_image.shape
-
+    print("2. Đang đưa ảnh vào hàm predict_image...")
     result = predict_image(test_image_path)
-    x1, y1, x2, y2 = result['bbox']
-    out_image = cv2.rectangle(test_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-   
-    label = f"Face: {result['confidence']*100:.1f}%"
-    cv2.putText(out_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2) 
-    cv2.imshow("Result", out_image)
+    
+    print("3. Kết quả hàm predict trả về là:", result) # Dòng này cực kỳ quan trọng để check lỗi ẩn
+    
+    if result.get("face_detected", False):
+        x1, y1, x2, y2 = map(int, result['bbox'])
+        out_image = cv2.rectangle(test_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+       
+        face_prob = (1.0 - result['confidence']) * 100
+        label = f"Face: {face_prob:.1f}%"
+        
+        cv2.putText(out_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2) 
+        cv2.imshow("Result", out_image)
+    else:
+        cv2.imshow("Result", test_image)
+        
+    print("4. Đang đợi bấm phím để đóng cửa sổ...")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
-
+    print("5. Chương trình kết thúc an toàn!")

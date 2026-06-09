@@ -45,12 +45,8 @@ def target_transforms(string_data):
     
     elements = [float(x) for x in string_data.split()]
     cx, cy, w, h = elements[1:5]
-    x1 = cx - w/2
-    y1 = cy - h/2
-    x2 = cx + w/2
-    y2 = cy + h/2
 
-    return torch.tensor([0.0, x1, y1, x2, y2])
+    return torch.tensor([0.0, cx, cy, w, h])
 
 # ================= MODEL =================
 class CNN(nn.Module):
@@ -104,10 +100,27 @@ class FaceData(Dataset):
         self.target_transform = target_transform
 
         self.img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(('.jpg', '.jpeg', '.png'))])
-        self.label_files = sorted([f for f in os.listdir(label_dir) if f.endswith('.txt')])
+        all_label_files = [f for f in os.listdir(label_dir) if f.endswith('.txt')]
+        label_map = {os.path.splitext(f)[0]: f for f in all_label_files}
+
+        self.label_files = []
+        missing_labels = []
+        for img_file in self.img_files:
+            base_name = os.path.splitext(img_file)[0]
+            if base_name in label_map:
+                self.label_files.append(label_map[base_name])
+            else:
+                missing_labels.append(img_file)
+
+        if missing_labels:
+            raise ValueError(
+                f"Không tìm thấy nhãn cho {len(missing_labels)} ảnh. Ví dụ: {missing_labels[:5]}"
+            )
 
         if len(self.img_files) != len(self.label_files):
-            raise ValueError(f"Số lượng ảnh ({len(self.img_files)}) và nhãn ({len(self.label_files)}) không khớp nhau!")
+            raise ValueError(
+                f"Số lượng ảnh ({len(self.img_files)}) và nhãn ({len(self.label_files)}) không khớp nhau!"
+            )
 
     def __len__(self):
         return len(self.img_files)
@@ -133,7 +146,7 @@ class FaceData(Dataset):
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 TRAIN_DIR = os.path.join(current_dir, '..', 'dataset', 'train')
-VAL_DIR = os.path.join(current_dir, '..', 'dataset', 'val')
+VAL_DIR = os.path.join(current_dir, '..', 'dataset', 'valid')
 
 if not os.path.isdir(TRAIN_DIR):
     raise FileNotFoundError(f"Train directory not found: {TRAIN_DIR}")
@@ -155,8 +168,8 @@ val_dataset = FaceData(
     target_transform = target_transforms
 )
 
-train_loader = DataLoader(train_dataset, batch_size = 32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size = 32, shuffle = True)
+val_loader = DataLoader(val_dataset, batch_size = 32, shuffle = False)
 
 # ================= DEVICE =================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -167,7 +180,7 @@ model = model.to(device)
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.AdamW(model.parameters(), LEARNING_RATE)
 
-best_acc = 0
+best_iou = 0.0
 for epoch in range(EPOCHS):
 
     # ================= TRAIN =================
@@ -187,22 +200,30 @@ for epoch in range(EPOCHS):
 
         pred_conf = outputs[:, 0]
         pred_boxes = torch.sigmoid(outputs[:,1:5])
-        true_conf = labels[:, 0]      
+        true_conf = labels[:, 0]
         true_boxes = labels[:, 1:5]
-        
-        x1 = torch.minimum(pred_boxes[:,0], pred_boxes[:,2])
-        y1 = torch.minimum(pred_boxes[:,1], pred_boxes[:,3])
 
-        x2 = torch.maximum(pred_boxes[:,0], pred_boxes[:,2])
-        y2 = torch.maximum(pred_boxes[:,1], pred_boxes[:,3])
+        # Convert YOLO-format boxes (cx, cy, w, h) to xyxy for IoU/loss
+        pred_cx, pred_cy, pred_w, pred_h = pred_boxes[:,0], pred_boxes[:,1], pred_boxes[:,2], pred_boxes[:,3]
+        true_cx, true_cy, true_w, true_h = true_boxes[:,0], true_boxes[:,1], true_boxes[:,2], true_boxes[:,3]
 
-        pred_boxes = torch.stack([x1, y1, x2, y2], dim=1)
+        pred_x1 = pred_cx - pred_w / 2
+        pred_y1 = pred_cy - pred_h / 2
+        pred_x2 = pred_cx + pred_w / 2
+        pred_y2 = pred_cy + pred_h / 2
+        pred_boxes_xyxy = torch.stack([pred_x1, pred_y1, pred_x2, pred_y2], dim=1).clamp(0.0, 1.0)
+
+        true_x1 = true_cx - true_w / 2
+        true_y1 = true_cy - true_h / 2
+        true_x2 = true_cx + true_w / 2
+        true_y2 = true_cy + true_h / 2
+        true_boxes_xyxy = torch.stack([true_x1, true_y1, true_x2, true_y2], dim=1).clamp(0.0, 1.0)
 
         loss_conf = criterion(pred_conf, true_conf)
 
         mask = (true_conf == 0.0)
         if mask.sum() > 0:
-            loss_box = ops.complete_box_iou_loss(pred_boxes[mask], true_boxes[mask], reduction='mean')
+            loss_box = ops.complete_box_iou_loss(pred_boxes_xyxy[mask], true_boxes_xyxy[mask], reduction='mean')
             total_loss = (LAMBDA_CONF * loss_conf) + (LAMBDA_BOX * loss_box)
         else:
             loss_box = 0.0
@@ -245,13 +266,20 @@ for epoch in range(EPOCHS):
             true_conf = labels[:, 0]
             true_boxes = labels[:, 1:5]
 
-            x1 = torch.minimum(pred_boxes[:,0], pred_boxes[:,2])
-            y1 = torch.minimum(pred_boxes[:,1], pred_boxes[:,3])
+            pred_cx, pred_cy, pred_w, pred_h = pred_boxes[:,0], pred_boxes[:,1], pred_boxes[:,2], pred_boxes[:,3]
+            true_cx, true_cy, true_w, true_h = true_boxes[:,0], true_boxes[:,1], true_boxes[:,2], true_boxes[:,3]
 
-            x2 = torch.maximum(pred_boxes[:,0], pred_boxes[:,2])
-            y2 = torch.maximum(pred_boxes[:,1], pred_boxes[:,3])
+            pred_x1 = pred_cx - pred_w / 2
+            pred_y1 = pred_cy - pred_h / 2
+            pred_x2 = pred_cx + pred_w / 2
+            pred_y2 = pred_cy + pred_h / 2
+            pred_boxes_xyxy = torch.stack([pred_x1, pred_y1, pred_x2, pred_y2], dim=1).clamp(0.0, 1.0)
 
-            pred_boxes = torch.stack([x1, y1, x2, y2], dim=1)
+            true_x1 = true_cx - true_w / 2
+            true_y1 = true_cy - true_h / 2
+            true_x2 = true_cx + true_w / 2
+            true_y2 = true_cy + true_h / 2
+            true_boxes_xyxy = torch.stack([true_x1, true_y1, true_x2, true_y2], dim=1).clamp(0.0, 1.0)
 
             # ===== Loss =====
             loss_conf = criterion(pred_conf, true_conf)
@@ -259,7 +287,7 @@ for epoch in range(EPOCHS):
             mask = (true_conf == 0.0)
 
             if mask.sum() > 0:
-                loss_box = ops.complete_box_iou_loss(pred_boxes[mask], true_boxes[mask], reduction='mean')
+                loss_box = ops.complete_box_iou_loss(pred_boxes_xyxy[mask], true_boxes_xyxy[mask], reduction='mean')
                 v_loss = LAMBDA_CONF * loss_conf + LAMBDA_BOX * loss_box
             else:
                 v_loss = LAMBDA_CONF * loss_conf
@@ -276,8 +304,8 @@ for epoch in range(EPOCHS):
             # ===== IoU =====
             if mask.sum() > 0:
                 iou_matrix = ops.box_iou(
-                    pred_boxes[mask],
-                    true_boxes[mask]
+                    pred_boxes_xyxy[mask],
+                    true_boxes_xyxy[mask]
                 )
 
                 ious = iou_matrix.diag()
@@ -321,16 +349,16 @@ for epoch in range(EPOCHS):
     checkpoint_dir = os.path.join(current_dir, '..', 'checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    if det_acc > best_acc:
-        best_acc = det_acc
+    if mean_iou > best_iou:
+        best_iou = mean_iou
         checkpoint_path = os.path.join(checkpoint_dir, 'model.pth')
         torch.save({
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'best_acc': best_acc,
+            'best_iou': best_iou,
             'train_loss': train_loss_avg,
             'val_loss': val_loss_avg,
             'mean_iou': mean_iou
         }, checkpoint_path)
-        print(f"✓ Checkpoint saved (Det Acc: {det_acc:.2f}%)")
+        print(f"✓ Checkpoint saved (Mean IoU: {mean_iou:.4f})")
