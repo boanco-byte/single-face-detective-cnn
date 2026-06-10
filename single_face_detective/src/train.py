@@ -6,12 +6,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.ops as ops
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
-LEARNING_RATE = 3e-4
-EPOCHS = 20
+LEARNING_RATE = 1e-4
+EPOCHS = 50
 LAMBDA_CONF = 1.0
 LAMBDA_BOX = 5.0
 
@@ -30,6 +30,7 @@ train_transforms = transforms.Compose([
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0))], p=0.3),
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
+    transforms.RandomErasing(p=0.4, scale=(0.02, 0.2), value='random'),
     transforms.Normalize(mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5])
 ])
 
@@ -49,47 +50,78 @@ def target_transforms(string_data):
     return torch.tensor([0.0, cx, cy, w, h])
 
 # ================= MODEL =================
-class CNN(nn.Module):
+class FaceDetector(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.Conv2d(in_channels = 3, out_channels = 32, kernel_size = 3, padding = 1),
             nn.BatchNorm2d(num_features = 32),
             nn.ReLU(),
+
+            nn.Conv2d(in_channels = 32, out_channels = 32, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 32),
+            nn.ReLU(),
+
             nn.MaxPool2d(kernel_size = 2),
 
             nn.Conv2d(in_channels = 32, out_channels = 64, kernel_size = 3, padding = 1),
             nn.BatchNorm2d(num_features = 64),
             nn.ReLU(),
+
+            nn.Conv2d(in_channels = 64, out_channels = 64, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 64),
+            nn.ReLU(),
+
             nn.MaxPool2d(kernel_size = 2),
 
             nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 3, padding = 1),
             nn.BatchNorm2d(num_features = 128),
             nn.ReLU(),
+
+            nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 128),
+            nn.ReLU(),
+
             nn.MaxPool2d(kernel_size = 2),
 
             nn.Conv2d(in_channels = 128, out_channels = 256, kernel_size = 3, padding = 1),
             nn.BatchNorm2d(num_features = 256),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size = 2),
 
-            nn.Conv2d(in_channels = 256, out_channels = 512, kernel_size = 3, padding = 1),
-            nn.BatchNorm2d(num_features = 512),
+            nn.Conv2d(in_channels = 256, out_channels = 256, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 256),
             nn.ReLU(),
-
-            nn.AdaptiveAvgPool2d((3, 3)),
-
-            nn.Flatten(),
-
-            nn.Linear(in_features = 512 * 3 * 3, out_features = 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-
-            nn.Linear(in_features = 128, out_features = 5)
         )
 
+
+        self.conf_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
+        )
+        
+        # Bounding box head
+        self.boxes_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((7, 7)),
+            nn.Flatten(),
+            nn.Linear(256 * 7 * 7, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4),
+            nn.Sigmoid()  # Keep bbox in [0, 1]
+        )
+    
     def forward(self, x):
-        return self.model(x)
+       backbone = self.backbone(x)
+       conf = self.conf_head(backbone)
+       boxes = self.boxes_head(backbone)
+
+       return conf, boxes
     
 # ================= DATA =================
 class FaceData(Dataset):
@@ -174,17 +206,17 @@ val_loader = DataLoader(val_dataset, batch_size = 32, shuffle = False)
 # ================= DEVICE =================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Đang chạy cấu hình trên thiết bị: {device}")
-model = CNN()
-model = model.to(device)
+backbone = FaceDetector()
+backbone = backbone.to(device)
 
-criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.AdamW(model.parameters(), LEARNING_RATE)
+criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([4.26]).to(device))
+optimizer = optim.AdamW(backbone.parameters(), LEARNING_RATE)
 
 best_iou = 0.0
 for epoch in range(EPOCHS):
 
     # ================= TRAIN =================
-    model.train()
+    backbone.train()
 
     train_loss = 0
     train_correct = 0
@@ -196,10 +228,9 @@ for epoch in range(EPOCHS):
 
         optimizer.zero_grad()
 
-        outputs = model(images) 
+        pred_conf, pred_boxes = backbone(images) 
+        pred_conf = pred_conf.squeeze(1)
 
-        pred_conf = outputs[:, 0]
-        pred_boxes = torch.sigmoid(outputs[:,1:5])
         true_conf = labels[:, 0]
         true_boxes = labels[:, 1:5]
 
@@ -223,7 +254,7 @@ for epoch in range(EPOCHS):
 
         mask = (true_conf == 0.0)
         if mask.sum() > 0:
-            loss_box = ops.complete_box_iou_loss(pred_boxes_xyxy[mask], true_boxes_xyxy[mask], reduction='mean')
+            loss_box = ops.distance_box_iou_loss(pred_boxes_xyxy[mask], true_boxes_xyxy[mask], reduction='mean')
             total_loss = (LAMBDA_CONF * loss_conf) + (LAMBDA_BOX * loss_box)
         else:
             loss_box = 0.0
@@ -237,7 +268,7 @@ for epoch in range(EPOCHS):
     train_loss_avg = train_loss / len(train_loader) if len(train_loader) > 0 else 0.0
 
     # ================= VALIDATION =================
-    model.eval()
+    backbone.eval()
 
     val_loss = 0
 
@@ -259,10 +290,9 @@ for epoch in range(EPOCHS):
             images = images.to(device)
             labels = labels.to(device)
 
-            outputs = model(images)
-
-            pred_conf = outputs[:, 0]
-            pred_boxes = torch.sigmoid(outputs[:,1:5])
+            pred_conf, pred_boxes = backbone(images)
+            pred_conf = pred_conf.squeeze(1)
+            
             true_conf = labels[:, 0]
             true_boxes = labels[:, 1:5]
 
@@ -287,7 +317,7 @@ for epoch in range(EPOCHS):
             mask = (true_conf == 0.0)
 
             if mask.sum() > 0:
-                loss_box = ops.complete_box_iou_loss(pred_boxes_xyxy[mask], true_boxes_xyxy[mask], reduction='mean')
+                loss_box = ops.distance_box_iou_loss(pred_boxes_xyxy[mask], true_boxes_xyxy[mask], reduction='mean')
                 v_loss = LAMBDA_CONF * loss_conf + LAMBDA_BOX * loss_box
             else:
                 v_loss = LAMBDA_CONF * loss_conf
@@ -302,20 +332,30 @@ for epoch in range(EPOCHS):
             val_total += true_conf.size(0)
 
             # ===== IoU =====
-            if mask.sum() > 0:
+            face_gt = (true_conf == 0.0)
+            face_pred = (preds == 0.0)
+
+            valid_iou_mask = face_gt & face_pred
+
+            if valid_iou_mask.sum() > 0:
+
                 iou_matrix = ops.box_iou(
-                    pred_boxes_xyxy[mask],
-                    true_boxes_xyxy[mask]
+                    pred_boxes_xyxy[valid_iou_mask],
+                    true_boxes_xyxy[valid_iou_mask]
                 )
 
                 ious = iou_matrix.diag()
 
                 iou_sum += ious.sum().item()
                 iou_count += len(ious)
-
-                # ===== Detection accuracy =====
-                det_correct += (ious > 0.5).sum().item()
-                det_total += len(ious)
+            
+            mask = (true_conf == 0.0)
+            if mask.sum() > 0:
+                iou_mat = ops.box_iou(pred_boxes_xyxy, true_boxes_xyxy)
+                ious_all = iou_mat.diag()
+                correct_det_mask = (true_conf == 0.0) & (preds == 0.0) & (ious_all > 0.5)
+                det_correct += correct_det_mask.sum().item()
+                det_total += mask.sum().item()
 
 
     # ===== Statistics =====
@@ -336,7 +376,7 @@ for epoch in range(EPOCHS):
         if det_total > 0 else 0.0
     )
 
-    print(f"Epoch {epoch+1}")
+    print(f"Epoch {epoch+1}/{EPOCHS}")
     print(f"Train Loss: {train_loss_avg:.4f}")
     print(
         f"Val Loss: {val_loss_avg:.4f} | "
@@ -354,7 +394,7 @@ for epoch in range(EPOCHS):
         checkpoint_path = os.path.join(checkpoint_dir, 'model.pth')
         torch.save({
             'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': backbone.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'best_iou': best_iou,
             'train_loss': train_loss_avg,
