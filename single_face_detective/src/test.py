@@ -55,12 +55,20 @@ class FaceDetector(nn.Module):
             nn.Flatten(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(128, 1)
         )
         
         # Bounding box head
         self.boxes_head = nn.Sequential(
+            nn.Conv2d(in_channels = 256, out_channels = 256, kernel_size = 3, padding = 1),
+            nn.BatchNorm2d(num_features = 256),
+            nn.ReLU(),
+
+            nn.Conv2d(in_channels = 256, out_channels = 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_features = 256),
+            nn.ReLU(),
+
             nn.AdaptiveAvgPool2d((7, 7)),
             nn.Flatten(),
             nn.Linear(256 * 7 * 7, 256),
@@ -162,8 +170,7 @@ def predict_folder(folder_path):
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    test_image_path = r"C:/Python/single_face_detective/dataset/train/images/IMG_8083_jpg.rf.PcxI2kfPRio7KMfOgtKQ.jpg"
-    print("1. Đang đọc ảnh bằng OpenCV...")
+    test_image_path = r"C:/CNN/dataset/train/images/15391513329330sooq10859_jpg.rf.w7qc2cXNYhz7e6k8hgDA.jpg"
     test_image = cv2.imread(test_image_path)
     if test_image is None:
         print(f"Không thể mở hoặc tìm thấy ảnh tại đường dẫn: {test_image_path}")
