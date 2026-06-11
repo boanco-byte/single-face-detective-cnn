@@ -167,7 +167,6 @@ class ResNet18(nn.Module):
         predictions = torch.flatten(predictions, start_dim=1)
         # Kích thước đầu ra cuối cùng: [Batch_size, 7 * 7 * num_anchors * (4 + num_classes)]
 
-        print(predictions.shape)
         return predictions
     
 
