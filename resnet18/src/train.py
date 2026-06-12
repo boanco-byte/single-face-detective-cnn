@@ -1,5 +1,6 @@
 import os
 import cv2
+from typing import Dict
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -194,14 +195,75 @@ class FPN(nn.Module):
         }
            
 
-in_channels = [64, 128, 256, 512]
+class AnchorGenerator(nn.Module):
+    def __init__(self, scales, ratios):
+        super().__init__()
+        self.scales = torch.tensor(scales)
+        self.ratios = torch.tensor(ratios)
 
-print(len(in_channels))
+        self.base_anchors = nn.ParameterList()
 
-resnet = ResNet18()
-fpn = FPN(in_channels, 256)
+        for scale in scales:
+            width = scale * torch.sqrt(self.ratios)        # [num_ratios]
+            height = scale / torch.sqrt(self.ratios)       # [num_ratios]
 
-test = torch.randn(1, 3, 224, 224)
-test = resnet(test)
-test = fpn(test)
-print(test["p2"].shape)
+            anchor_shape = torch.stack([width, height], dim=-1) / 2              # [num_ratios, 2]
+            base_anchor = torch.cat([-anchor_shape, anchor_shape], dim=-1)       # [num_ratios, 4]
+
+            self.base_anchors.append(nn.Parameter(base_anchor.unsqueeze(dim=0), requires_grad=False))    
+            # Thêm chiều để broadcast: [1, num_ratios, 4]
+
+    def forward(self, feature_maps, strides):
+        output_anchors: Dict[str, torch.Tensor] = {}
+
+        # Dùng enumerate để lấy chỉ số level_idx làm khóa truy cập mảng strides
+        # level_idx: Chỉ số của tầng FPN (0, 1, 2...)
+        # level_name: Tên của tầng FPN (ví dụ: "p3", "p4", "p5"...)
+        
+        for level_idx, (level_name, feature_map) in enumerate(feature_maps.items()):
+            device = feature_map.device
+            grid_h, grid_w = feature_map.shape[-2:] 
+            
+            stride = strides[level_idx] 
+            
+            # Lấy anchor mẫu tương ứng với mức scale của level_idx này: [1, num_ratios, 4]
+            base_anchor = self.base_anchors[level_idx].to(device)              # [1, num_ratios, 4]
+
+
+            cx = (torch.arange(grid_w, device=device) + 0.5) * stride          # [grid_w]
+            cy = (torch.arange(grid_h, device=device) + 0.5) * stride          # [grid_h]
+
+            grid_y, grid_x = torch.meshgrid(cy, cx, indexing='ij')             #[grid_h, grid_w]
+            centers = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)     # [grid_h * grid_w, 2]
+            centers = centers.repeat(1, 2).unsqueeze(dim=1)                    # [grid_h * grid_w, 1, 4]
+            
+            # Broadcast: [grid_h * grid_w, 1, 4] + [1, num_ratios, 4]
+            level_anchors = centers + base_anchor                              # [grid_h * grid_w, num_ratios, 4]
+            level_anchors = level_anchors.reshape(-1, 4)                       # [grid_h * grid_w * num_ratios, 4]
+
+            output_anchors[level_name] = level_anchors
+
+        return output_anchors
+
+
+scales = [32, 64, 128, 256]
+ratios = [0.5, 1.0, 2.0]
+strides_list = [4, 8, 16, 32] # KHAI BÁO DẠNG MẢNG THEO Ý BẠN
+
+# Khởi tạo mô hình
+generator = AnchorGenerator(scales=scales, ratios=ratios)
+
+# Tạo dữ liệu giả lập (Dictionary feature_maps đầu ra từ FPN)
+fake_feature_maps = {
+    "p2": torch.randn(1, 256, 56, 56),
+    "p3": torch.randn(1, 256, 28, 28),
+    "p4": torch.randn(1, 256, 14, 14),
+    "p5": torch.randn(1, 256, 7, 7),
+}
+
+# Gọi hàm forward truyền vào strides dạng List
+anchors_result = generator(fake_feature_maps, strides_list)
+
+# In kết quả kiểm tra kích thước
+for level, anchors in anchors_result.items():
+    print(f"Tầng {level}: Kích thước tensor Anchor = {list(anchors.shape)}")
