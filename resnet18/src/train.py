@@ -19,7 +19,7 @@ class ResNet18(nn.Module):
 
         self.relu = nn.ReLU()
         
-    # CỤM 1 (conv2_x): Biến đổi từ 64 kênh (112x112) -> 64 kênh (56x56)
+    # CỤM 1 (conv2_x): Biến đổi từ 64 kênh (112x112) -> 64 kênh (56x56)   
         self.conv2_x_block1 = nn.Sequential(
             nn.Conv2d(in_channels = 64, out_channels = 64, kernel_size = 3, stride = 1, padding = 1, bias = False),
             nn.BatchNorm2d(64),
@@ -34,6 +34,8 @@ class ResNet18(nn.Module):
             nn.Conv2d(in_channels = 64, out_channels = 64, kernel_size = 3, stride = 1, padding = 1, bias = False),
             nn.BatchNorm2d(64)
         )
+    # [Batch_size, Channels = 64, Height = 56, Width = 56]
+        
         
     # CỤM 2 (conv3_x): Biến đổi từ 64 kênh (56x56) -> 128 kênh (28x28)
         self.conv3_x_block1 = nn.Sequential(
@@ -54,6 +56,7 @@ class ResNet18(nn.Module):
             nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1, stride = 2, bias = False),
             nn.BatchNorm2d(128)
         )
+    # [Batch_size, Channels = 128, Height = 28, Width = 28]
 
         
     # CỤM 3 (conv4_x): Biến đổi từ 128 kênh (28x28) -> 256 kênh (14x14)  
@@ -75,6 +78,7 @@ class ResNet18(nn.Module):
             nn.Conv2d(in_channels = 128, out_channels = 256, kernel_size = 1, stride = 2, bias = False),
             nn.BatchNorm2d(256)
         )
+    # [Batch_size, Channels = 256, Height = 14, Width = 14]
 
         
     # CỤM 4 (conv5_x): Biến đổi từ 256 kênh (14x14) -> 512 kênh (7x7)
@@ -96,6 +100,8 @@ class ResNet18(nn.Module):
             nn.Conv2d(in_channels = 256, out_channels = 512, kernel_size = 1, stride = 2, bias = False),
             nn.BatchNorm2d(512)
         )
+    # [Batch_size, Channels = 512, Height = 7, Width = 7]
+        
 
     def forward(self, x):
         x1 = self.conv1(x)
@@ -110,7 +116,8 @@ class ResNet18(nn.Module):
         identity = x2                    # Nhánh phụ: Giữ nguyên đầu vào của khối 2
         fx = self.conv2_x_block2(x2)      # Nhánh chính: Tính toán qua khối 2 với trọng số riêng
         c2 = self.relu(fx + identity)     # Cộng khối dư và kích hoạt ReLU -> Đầu ra tầng conv2_x
-        
+    # c2.shape = [Batch_size, Channels = 64, Height = 56, Width = 56]
+
     # CỤM 2
         # KHỐI 1
         identity = self.downsample3(c2)
@@ -121,7 +128,7 @@ class ResNet18(nn.Module):
         identity = x3
         fx = self.conv3_x_block2(x3)
         c3 = self.relu(fx + identity)
-
+    # c3.shape = [Batch_size, Channels = 128, Height = 28, Width = 28]
         
     # CỤM 3 (conv4_x)
         # KHỐI 1
@@ -133,6 +140,7 @@ class ResNet18(nn.Module):
         identity = x4
         fx = self.conv4_x_block2(x4)
         c4 = self.relu(fx + identity)
+    # c4.shape = [Batch_size, Channels = 256, Height = 14, Width = 14]
         
     # CỤM 4 (conv5_x)
         # KHỐI 1
@@ -144,7 +152,8 @@ class ResNet18(nn.Module):
         identity = x5
         fx = self.conv5_x_block2(x5)
         c5 = self.relu(fx + identity)
-
+    # c5.shape = [Batch_size, Channels = 512, Height = 7, Width = 7]
+        
         return {
             "c2": c2,
             "c3": c3,
@@ -245,6 +254,49 @@ class AnchorGenerator(nn.Module):
 
         return output_anchors
 
+
+class RPNHead(nn.Module):
+    def __init__(self, in_channels, num_anchors, num_classes):
+        super().__init__()
+        self.num_classes = num_classes
+        
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size = 3, padding = 1),     #[Batch_size, in_channels, Height, Width]
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
+
+        self.cls_logits = nn.Conv2d(in_channels, num_anchors * num_classes, kernel_size = 1, padding = 0)  
+        # [Batch_size, num_anchors * num_classes, Height, Width]    Thông thường số channels sẽ là 2 * num_anchors
+
+        self.bbox_pred = nn.Conv2d(in_channels, num_anchors * 4, kernel_size = 1, padding = 0)
+        # [Batch_size, num_anchors * 4, Height, Width]    (dx, dy, dw, dh)
+
+    def forward(self, feature_maps):
+        output_cls_logits: Dict[str, torch.Tensor] = {}
+        output_bbox_pred: Dict[str, torch.Tensor] = {}
+            
+        for level_idx, (level_name, feature_map) in enumerate(feature_maps.items()):
+            B, C, H, W = feature_map.shape
+            
+            conv = self.conv(feature_map)
+
+            cls_logits = self.cls_logits(conv)
+            bbox_pred = self.bbox_pred(conv)
+
+            # Đổi trục từ [Batch_size, Channels, Height, Width] -> [Batch_size, Height, Width, Channels]
+            cls_logits = cls_logits.permute(0, 2, 3, 1).contiguous()
+            bbox_pred = bbox_pred.permute(0, 2, 3, 1).contiguous()
+
+            # cls_logits.Shape từ [Batch_size, Height, Width, num_anchors * num_classes] -> [Batch_size, Height * Width * num_anchors, num_classes]
+            # bbox_pred.Shape từ [Batch_size, Height, Width, num_anchors * 4] -> [Batch_size, Height * Width * num_anchors, 4]
+            cls_logits = cls_logits.reshape(B, -1, self.num_classes)
+            bbox_pred = bbox_pred.reshape(B, -1, 4)
+                
+            output_cls_logits[level_name] = cls_logits
+            output_bbox_pred[level_name] = bbox_pred
+
+        return output_cls_logits, output_bbox_pred
 
 scales = [32, 64, 128, 256]
 ratios = [0.5, 1.0, 2.0]
