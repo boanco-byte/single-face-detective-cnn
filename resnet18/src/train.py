@@ -298,24 +298,148 @@ class RPNHead(nn.Module):
 
         return output_cls_logits, output_bbox_pred
 
+class RPN(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+
+
+    def decode(anchors_all, bbox_preds_all, width, height):
+        x1, y1, x2, y2 = torch.chunk(anchors_all, chunks=4, dim=-1)
+        dx, dy, dw, dh = torch.chunk(bbox_preds_all, chunks=4, dim=-1)  
+
+        anchor_w = x2 - x1
+        anchor_h = y2 - y1
+        anchor_x = (x1 + x2) / 2
+        anchor_y = (y1 + y2) / 2
+        
+        new_x = anchor_x + dx * anchor_w
+        new_y = anchor_y + dy * anchor_h
+        new_w = anchor_w * torch.exp(dw)
+        new_h = anchor_h * torch.exp(dh)
+        
+        new_x1 = torch.clamp((new_x - new_w / 2), min = 0, max = width)
+        new_y1 = torch.clamp((new_y - new_h / 2), min = 0, max = height)
+        new_x2 = torch.clamp((new_x + new_w / 2), min = 0, max = width)
+        new_y2 = torch.clamp((new_y + new_h / 2), min = 0, max = height)
+
+        proposal_boxes = torch.cat([new_x1, new_y1, new_x2, new_y2], dim = -1)
+        return proposal_boxes
+
+    def remove_small_box(proposal_boxes, cls_logits_all, mini_size):
+        x1, y1, x2, y2 = torch.chunk(proposal_boxes, chunks = 4, dim = -1)
+
+        width = x2 - x1
+        height = y2 - y1
+
+        mask = (width > mini_size) & (height > mini_size)
+
+        scores = cls_logits_all[..., 1]                          # Lọc cột object
+        
+        # Nếu thỏa mãn điều kiện (mask=True) thì giữ nguyên obj_logits, ngược lại (False) thì gán -inf
+        scores = torch.where(mask.squeeze(dim = -1), scores, float('-inf'))
+
+        return proposal_boxes, scores
+
+    def select_top_k_proposals(proposal_boxes, scores, k):
+        k = min(k, proposal_boxes.shape[1])
+        
+        top_scores, indices = torch.topk(scores, k = k, dim = -1)
+
+        bbox_indices = indices.unsqueeze(dim = -1).expand(-1, -1, 4)
+        proposal_boxes = torch.gather(proposal_boxes, dim = 1, index = bbox_indices)
+
+        return top_scores, proposal_boxes
+
+
+
+# Test
+
 scales = [32, 64, 128, 256]
 ratios = [0.5, 1.0, 2.0]
 strides_list = [4, 8, 16, 32] # KHAI BÁO DẠNG MẢNG THEO Ý BẠN
 
+width = height = 224
+
 # Khởi tạo mô hình
 generator = AnchorGenerator(scales=scales, ratios=ratios)
-
+rpnhead = RPNHead(256, 3, 2)
 # Tạo dữ liệu giả lập (Dictionary feature_maps đầu ra từ FPN)
 fake_feature_maps = {
-    "p2": torch.randn(1, 256, 56, 56),
-    "p3": torch.randn(1, 256, 28, 28),
-    "p4": torch.randn(1, 256, 14, 14),
-    "p5": torch.randn(1, 256, 7, 7),
+    "p2": torch.randn(5, 256, 56, 56),
+    "p3": torch.randn(5, 256, 28, 28),
+    "p4": torch.randn(5, 256, 14, 14),
+    "p5": torch.randn(5, 256, 7, 7),
 }
 
 # Gọi hàm forward truyền vào strides dạng List
-anchors_result = generator(fake_feature_maps, strides_list)
+anchors = generator(fake_feature_maps, strides_list)
+cls_logits, bbox_preds = rpnhead(fake_feature_maps)
 
-# In kết quả kiểm tra kích thước
-for level, anchors in anchors_result.items():
-    print(f"Tầng {level}: Kích thước tensor Anchor = {list(anchors.shape)}")
+anchors_all = torch.cat(list(anchors.values()), dim=-2)
+cls_logits_all = torch.cat(list(cls_logits.values()), dim=-2)
+bbox_preds_all = torch.cat(list(bbox_preds.values()), dim=-2)
+
+print(anchors_all.shape)
+print(cls_logits_all.shape)
+print(bbox_preds_all.shape)
+
+x1, y1, x2, y2 = torch.chunk(anchors_all, chunks=4, dim=-1)
+dx, dy, dw, dh = torch.chunk(bbox_preds_all, chunks=4, dim=-1)
+
+anchor_w = x2 - x1
+anchor_h = y2 - y1
+
+anchor_x = (x1 + x2) / 2
+anchor_y = (y1 + y2) / 2
+
+new_x = anchor_x + dx * anchor_w
+new_y = anchor_y + dy * anchor_h
+
+new_w = anchor_w * torch.exp(dw)
+new_h = anchor_h * torch.exp(dh)
+
+new_x1 = torch.clamp((new_x - new_w / 2), min = 0, max = width)
+new_y1 = torch.clamp((new_y - new_h / 2), min = 0, max = height)
+new_x2 = torch.clamp((new_x + new_w / 2), min = 0, max = width)
+new_y2 = torch.clamp((new_y + new_h / 2), min = 0, max = height)
+
+proposal_boxes = torch.cat([new_x1, new_y1, new_x2, new_y2], dim = 2)
+print("Kich thuoc cua proposal_boxes: ", proposal_boxes.shape)
+size = proposal_boxes.shape
+
+widths = new_x2 - new_x1
+heights = new_y2 - new_y1
+
+print(widths.shape)
+print(heights.shape)
+mini_size = 16
+mask = ((widths.squeeze() >= mini_size) & (heights.squeeze() >= mini_size))
+print("Kich thuoc cua mask: ", mask.shape)
+"""
+proposals = proposal_boxes[mask]
+scores = cls_logits_all[...,0][mask]
+bbox_preds = bbox_preds_all[mask]
+
+print("Kich thuoc cua scores: ", scores.shape)
+print("Kich thuoc cua bbox_pred: ", bbox_preds.shape)
+print("Kich thuoc cua proposal: ", proposals.shape)
+"""
+TOP_K = 2000
+TOP_K = min(TOP_K, size[1])
+
+cls_logits_top, indices = torch.topk(cls_logits_all[..., 0:1], k = TOP_K, dim = -2)   #cls_logits_all co kich thuoc [Batch, Nums, classes = 2)
+print("Kich thuoc cua indices: ", indices.shape)
+bbox_indices = indices.expand(-1, -1, 4)
+bbox_preds_top = torch.gather(bbox_preds_all, dim=-2, index=bbox_indices)
+proposal_boxes_top = torch.gather(proposal_boxes, dim=-2, index=bbox_indices)
+
+print("Kich thuoc cua top cls_logits: ", cls_logits_top.shape)
+print("Kich thuoc cua top bbox_pred: ", bbox_preds_top.shape)
+print("Kich thuoc cua top proposal_boxes: ", proposal_boxes_top.shape)
+
+
+print("Kich thuoc new_x: ", new_x1.shape, " va so chieu: ", new_x.ndim)
+print("Kich thuoc new_y: ", new_y1.shape, " va so chieu: ", new_y.ndim)
+print("Kich thuoc new_w: ", new_x2.shape, " va so chieu: ", new_w.ndim)
+print("Kich thuoc new_h: ", new_y2.shape, " va so chieu: ", new_h.ndim)
